@@ -1,4 +1,11 @@
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.ILock;
 import com.hazelcast.core.IMap;
+import com.hazelcast.core.TransactionalMap;
+import com.hazelcast.transaction.TransactionContext;
+import com.hazelcast.transaction.TransactionOptions;
+import com.hazelcast.transaction.TransactionOptions.TransactionType;
+
 import org.quartz.*;
 import org.quartz.impl.matchers.GroupMatcher;
 import org.quartz.spi.*;
@@ -13,10 +20,17 @@ import java.util.Set;
  */
 public class HazelcastJobStore implements JobStore {
 
-    IMap<JobKey, JobDetail> jobMap;
-    IMap<TriggerKey, Trigger> triggerMap;
+	TransactionalMap<JobKey, JobDetail> jobMap;
+	TransactionalMap<TriggerKey, Trigger> triggerMap;
+	ILock lock;
 
-    @Override
+	private HazelcastInstance hazelcastInstance;
+	private TransactionContext transactionContext;
+
+	private String instanceId;
+	private String instanceName;
+
+	@Override
     public void initialize(ClassLoadHelper classLoadHelper, SchedulerSignaler schedulerSignaler) throws SchedulerConfigException {
 
     }
@@ -24,6 +38,14 @@ public class HazelcastJobStore implements JobStore {
     @Override
     public void schedulerStarted() throws SchedulerException {
         //TODO Setup required maps in hazelcast
+		TransactionOptions options = new TransactionOptions()
+				.setTransactionType( TransactionType.LOCAL );
+
+		transactionContext = hazelcastInstance.newTransactionContext(options);
+//
+//		TransactionalQueue queue = transactionContext.getQueue("myqueue");
+//		TransactionalMap map = transactionContext.getMap("mymap");
+//		TransactionalSet set = transactionContext.getSet("myset");
     }
 
     @Override
@@ -43,14 +65,13 @@ public class HazelcastJobStore implements JobStore {
 
     @Override
     public boolean supportsPersistence() {
-        //FIXME make optional
         return true;
     }
 
     @Override
     public long getEstimatedTimeToReleaseAndAcquireTrigger() {
         //TODO what is this?
-        return 0;
+        return 100;
     }
 
     @Override
@@ -58,56 +79,148 @@ public class HazelcastJobStore implements JobStore {
         return true;
     }
 
-    //Map of OperableTrigger -> JobDetail
-    //Map of JobKey -> JobDetail
-    //List of JobDetails (without triggers)
-    //List of OperableTrigger (without jobs)
-    //Map TriggerKey -> OperableTrigger
-    //Map String -> Calendar
-
-    //JobKey -> JobDetail
-    //TriggerKey -> TriggerDetail
+	private void handleException(Exception e) throws JobPersistenceException {
+		if(e instanceof ObjectAlreadyExistsException) {
+			throw (ObjectAlreadyExistsException) e;
+		}
+		throw new JobPersistenceException(e.getMessage(), e);
+	}
 
     @Override
     public void storeJobAndTrigger(JobDetail jobDetail, OperableTrigger operableTrigger) throws ObjectAlreadyExistsException, JobPersistenceException {
-        if(jobMap.containsKey(jobDetail.getKey())) {
-            throw new ObjectAlreadyExistsException(jobDetail);
-        }
-        jobMap.put(jobDetail.getKey(), jobDetail);
-        triggerMap.put(operableTrigger.getKey(), operableTrigger);
+		lock.lock();
+		transactionContext.beginTransaction();
+		checkJobAlreadyExists(jobDetail);
+		try {
+			storeJob(jobDetail, false);
+			storeTrigger(operableTrigger, false);
+			transactionContext.commitTransaction();
+		} catch (Exception e) {
+			transactionContext.rollbackTransaction();
+			handleException(e);
+		} finally {
+			lock.unlock();
+		}
     }
 
-    @Override
+	@Override
     public void storeJob(JobDetail jobDetail, boolean replaceExisting) throws ObjectAlreadyExistsException, JobPersistenceException {
-        if(replaceExisting && jobMap.containsKey(jobDetail.getKey())) {
-            throw new ObjectAlreadyExistsException(jobDetail);
-        }
-        jobMap.put(jobDetail.getKey(), jobDetail);
+		lock.lock();
+		transactionContext.beginTransaction();
+		try {
+			if (replaceExisting) {
+				checkJobAlreadyExists(jobDetail);
+			}
+			jobMap.put(jobDetail.getKey(), jobDetail);
+			transactionContext.commitTransaction();
+		} catch (Exception e) {
+			transactionContext.rollbackTransaction();
+			handleException(e);
+		} finally {
+			lock.unlock();
+		}
     }
 
     @Override
     public void storeJobsAndTriggers(Map<JobDetail, Set<? extends Trigger>> jobDetailSetMap, boolean replaceExisting) throws ObjectAlreadyExistsException, JobPersistenceException {
-        //TODO what is difference between Trigger and OeperableTrigger, look at examples?
-    }
+		lock.lock();
+		transactionContext.beginTransaction();
+		try {
+			if(!replaceExisting) {
+				checkForExistingJobsOrTriggers(jobDetailSetMap);
+			}
+			for (JobDetail jobDetail : jobDetailSetMap.keySet()) {
+				storeJob(jobDetail, true);
 
-    @Override
+				for(Trigger trigger : jobDetailSetMap.get(jobDetail)) {
+					storeTrigger((OperableTrigger) trigger, true);
+				}
+			}
+		} catch (Exception e) {
+			transactionContext.rollbackTransaction();
+			handleException(e);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private void checkForExistingJobsOrTriggers(Map<JobDetail, Set<? extends Trigger>> jobDetailSetMap) throws JobPersistenceException {
+		for (JobDetail jobDetail : jobDetailSetMap.keySet()) {
+			checkJobAlreadyExists(jobDetail);
+			for(Trigger trigger : jobDetailSetMap.get(jobDetail)) {
+				checkTriggerAlreadyExists(trigger);
+			}
+		}
+	}
+
+	private void checkTriggerAlreadyExists(Trigger trigger) throws JobPersistenceException {
+		if(checkExists(trigger.getKey())) {
+			throw new ObjectAlreadyExistsException(trigger);
+		}
+	}
+
+	private void checkJobAlreadyExists(JobDetail jobDetail) throws JobPersistenceException {
+		if(checkExists(jobDetail.getKey())) {
+			throw new ObjectAlreadyExistsException(jobDetail);
+		}
+	}
+
+	@Override
     public boolean removeJob(JobKey jobKey) throws JobPersistenceException {
-        return false;
+		lock.lock();
+		transactionContext.beginTransaction();
+		boolean removed = false;
+		try {
+			removed = jobMap.remove(jobKey) != null;
+			transactionContext.commitTransaction();
+		} catch(Exception e) {
+			transactionContext.rollbackTransaction();
+			handleException(e);
+		} finally {
+			lock.unlock();
+		}
+		return removed;
     }
 
     @Override
     public boolean removeJobs(List<JobKey> jobKeys) throws JobPersistenceException {
-        return false;
+		lock.lock();
+		transactionContext.beginTransaction();
+		boolean removed = true;
+		try {
+			for(JobKey jobKey : jobKeys) {
+				removed = removed && removeJob(jobKey);
+			}
+			transactionContext.commitTransaction();
+		} catch(Exception e) {
+			transactionContext.rollbackTransaction();
+			handleException(e);
+		} finally {
+			lock.unlock();
+		}
+		return removed;
     }
 
     @Override
     public JobDetail retrieveJob(JobKey jobKey) throws JobPersistenceException {
-        return null;
+        lock.lock();
+		JobDetail jobDetail = null;
+		try {
+			jobDetail = jobMap.get(jobKey);
+		} catch (Exception e) {
+			handleException(e);
+		} finally {
+			lock.unlock();
+		}
+		return jobDetail;
     }
 
     @Override
-    public void storeTrigger(OperableTrigger operableTrigger, boolean b) throws ObjectAlreadyExistsException, JobPersistenceException {
-
+    public void storeTrigger(OperableTrigger operableTrigger, boolean replaceExisting) throws ObjectAlreadyExistsException, JobPersistenceException {
+		if(triggerMap.containsKey(operableTrigger.getKey()) && !replaceExisting) {
+			throw new ObjectAlreadyExistsException(operableTrigger);
+		}
+		triggerMap.put(operableTrigger.getKey(), operableTrigger);
     }
 
     @Override
@@ -286,17 +399,17 @@ public class HazelcastJobStore implements JobStore {
     }
 
     @Override
-    public void setInstanceId(String s) {
-
+    public void setInstanceId(String instanceId) {
+		this.instanceId = instanceId;
     }
 
     @Override
-    public void setInstanceName(String s) {
-
+    public void setInstanceName(String instanceName) {
+		this.instanceName = instanceName;
     }
 
     @Override
     public void setThreadPoolSize(int i) {
-
+		//NA
     }
 }
